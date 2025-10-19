@@ -89,3 +89,17 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+int
+sys_mmap(void)
+{
+  cprintf("sys_mmap called!\n");
+  return 0;
+}
+
+int
+sys_munmap(void)
+{
+  cprintf("sys_munmap called!\n");
+  return 0;
+}
