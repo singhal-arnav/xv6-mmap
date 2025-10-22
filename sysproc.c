@@ -94,12 +94,37 @@ int
 sys_mmap(void)
 {
   cprintf("sys_mmap called!\n");
-  return 0;
+  void *addr;
+  int length, prot, flags, fd, offset;
+  struct file *f;
+  if(argptr(0, (char **)&addr, sizeof(void *)) < 0)
+    return -1;
+  if(argint(1, &length) < 0)
+    return -1;
+  if(argint(2, &prot) < 0)
+    return -1;
+  if(argint(3, &flags) < 0)
+    return -1;
+  if(argint(4, &fd) < 0)
+    return -1;
+  if(argint(5, &offset) < 0)
+    return -1;
+
+  f = myproc()->ofile[fd];
+
+  if(fileread(f, (char *)addr, length) < 0)
+    return -1;
+
+  return (int)addr;
 }
 
 int
 sys_munmap(void)
 {
   cprintf("sys_munmap called!\n");
+  void *addr;
+  int length;
+  if(argptr(0, (char**)&addr, sizeof(void *)) < 0) return -1;
+  if(argint(1, &length) < 0) return -1;
   return 0;
 }
