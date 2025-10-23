@@ -112,10 +112,55 @@ sys_mmap(void)
 
   f = myproc()->ofile[fd];
 
-  if(fileread(f, (char *)addr, length) < 0)
+  int npages = (length + PGSIZE - 1) / PGSIZE;
+  int flag = 0, start, found = 0, va;
+
+  if((int)addr >= KERNBASE)
+    return 0;
+
+  va = PGROUNDDOWN((int)addr);
+  start = va;
+
+  for(; va < KERNBASE; va += PGSIZE) {
+    uint *pde, *pgtab, *pte;
+
+    pde = &(myproc()->pgdir[PDX((char *)va)]);
+    if(*pde & PTE_P){
+      pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
+    }
+    else {
+      if((pgtab = (pte_t*)kalloc()) == 0)
+        return 0;
+      memset(pgtab, 0, PGSIZE);
+      *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U;
+    }
+    pte = &pgtab[PTX((char *)va)];
+
+    int is_free;
+
+    if(pte == 0 || (*pte & PTE_P) == 0)
+      is_free = 1;
+    else
+      is_free = 0;
+
+    if(is_free) {
+      if(found == 0)
+        start = va;
+      found++;
+      if(found >= npages) {
+        flag = 1;
+        break;
+      }
+    }
+    else
+      found = 0;
+
+    cprintf("%d\n", start);
+  }
+  if(!flag || fileread(f, (char *)start, length) < 0)
     return -1;
 
-  return (int)addr;
+  return start;
 }
 
 int
