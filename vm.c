@@ -385,6 +385,23 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   return 0;
 }
 
+int
+page_fault_handler(struct proc *p, uint va)
+{
+  va = PGROUNDDOWN(va);
+  if(va >= p->sz && va < KERNBASE) {
+    char *mem = kalloc();
+    if(!mem)
+      return -1;
+    memset(mem, 0, PGSIZE);
+    if(mappages(p->pgdir, (char*)va, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0) {
+      kfree(mem);
+      return -1;
+    }
+  }
+  return 0;
+}
+
 //PAGEBREAK!
 // Blank page.
 //PAGEBREAK!
