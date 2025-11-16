@@ -118,8 +118,17 @@ sys_mmap(void)
   if((int)addr >= KERNBASE)
     return 0;
 
-  va = PGROUNDDOWN((int)addr);
-  start = va;
+  if(myproc()->mmap_region)
+    start = PGROUNDDOWN(myproc()->mmap_region->start - length);
+  else
+    start = PGROUNDDOWN(KERNBASE - length);
+  struct mmap_node *n = slab_alloc_node();
+  n->start = start;
+  n->end = start + length - 1;
+  n->next = myproc()->mmap_region;
+  myproc()->mmap_region = n;
+
+  va = start;
 
   for(; va < KERNBASE; va += PGSIZE) {
     uint *pde, *pgtab, *pte;

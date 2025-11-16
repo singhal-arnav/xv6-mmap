@@ -9,6 +9,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct mmap_node;
 
 // bio.c
 void            binit(void);
@@ -120,6 +121,10 @@ void            userinit(void);
 int             wait(void);
 void            wakeup(void*);
 void            yield(void);
+void            slab_init(void);
+struct mmap_node*  slab_alloc_node(void);
+void            slab_free_node(struct mmap_node*);
+void            slab_add_page(void);
 
 // swtch.S
 void            swtch(struct context**, struct context*);
