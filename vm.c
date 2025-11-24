@@ -6,6 +6,17 @@
 #include "mmu.h"
 #include "proc.h"
 #include "elf.h"
+#include "fcntl.h"
+
+struct file {
+  enum { FD_NONE, FD_PIPE, FD_INODE } type;
+  int ref; // reference count
+  char readable;
+  char writable;
+  struct pipe *pipe;
+  struct inode *ip;
+  uint off;
+};
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
@@ -390,16 +401,34 @@ page_fault_handler(struct proc *p, uint va)
 {
   va = PGROUNDDOWN(va);
   if(va >= p->sz && va < KERNBASE) {
+    struct mmap_node *m = p->mmap_region;
+    while(m){
+      if(va >= m->start && va <= m->end)
+        break;
+      m = m->next;
+    }
+    if(!m)
+      return -1;
+
+    int page_index = (va - m->start) / PGSIZE;
+    int file_offset = m->offset + page_index * PGSIZE;
     char *mem = kalloc();
     if(!mem)
       return -1;
-    memset(mem, 0, PGSIZE);
-    if(mappages(p->pgdir, (char*)va, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0) {
+    ilock(m->f->ip);
+    readi(m->f->ip, mem, file_offset, PGSIZE);
+    iunlock(m->f->ip);
+
+    int flags = PTE_U;
+    if(m->prot & PROT_WRITE)
+      flags |= PTE_W;
+    if(mappages(p->pgdir, (char*)va, PGSIZE, V2P(mem), flags) < 0) {
       kfree(mem);
       return -1;
     }
+    return 0;
   }
-  return 0;
+  return -1;
 }
 
 //PAGEBREAK!

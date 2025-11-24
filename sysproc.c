@@ -7,6 +7,8 @@
 #include "mmu.h"
 #include "proc.h"
 
+struct file;
+
 int
 sys_fork(void)
 {
@@ -112,64 +114,54 @@ sys_mmap(void)
 
   f = myproc()->ofile[fd];
 
-  int npages = (length + PGSIZE - 1) / PGSIZE;
-  int flag = 0, start, found = 0, va;
-
   if((int)addr >= KERNBASE)
     return 0;
 
-  if(myproc()->mmap_region)
-    start = PGROUNDDOWN(myproc()->mmap_region->start - length);
-  else
-    start = PGROUNDDOWN(KERNBASE - length);
-  struct mmap_node *n = slab_alloc_node();
-  n->start = start;
-  n->end = start + length - 1;
-  n->next = myproc()->mmap_region;
-  myproc()->mmap_region = n;
+  struct mmap_node *n, *p;
 
-  va = start;
+  p = myproc()->mmap_region;
+  while(p && p->next) {
+    if((p->next->start - p->end - 1) >= length) {
+      n = slab_alloc_node();
+      n->start = p->end + 1;
+      n->end = PGROUNDUP(n->start + length) - 1;
 
-  for(; va < KERNBASE; va += PGSIZE) {
-    uint *pde, *pgtab, *pte;
+      n->prot = prot;
+      n->flags = flags;
+      n->offset = offset;
+      n->f = f;
+      filedup(f);
 
-    pde = &(myproc()->pgdir[PDX((char *)va)]);
-    if(*pde & PTE_P){
-      pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
+      n->next = p->next;
+      p->next = n;
+      return n->start;
     }
-    else {
-      if((pgtab = (pte_t*)kalloc()) == 0)
-        return 0;
-      memset(pgtab, 0, PGSIZE);
-      *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U;
-    }
-    pte = &pgtab[PTX((char *)va)];
-
-    int is_free;
-
-    if(pte == 0 || (*pte & PTE_P) == 0)
-      is_free = 1;
-    else
-      is_free = 0;
-
-    if(is_free) {
-      if(found == 0)
-        start = va;
-      found++;
-      if(found >= npages) {
-        flag = 1;
-        break;
-      }
-    }
-    else
-      found = 0;
-
-    cprintf("%d\n", start);
+    p = p->next;
   }
-  if(!flag || fileread(f, (char *)start, length) < 0)
-    return -1;
 
-  return start;
+  n = slab_alloc_node();
+  if(!p)
+    n->start = PGROUNDDOWN(KERNBASE - length);
+  else
+    n->start = PGROUNDDOWN(myproc()->mmap_region->start - length);
+
+  if(n->start >= myproc()->sz) {
+    n->end = PGROUNDUP(n->start + length) - 1;
+    n->next = myproc()->mmap_region;
+    myproc()->mmap_region = n;
+
+    n->prot = prot;
+    n->flags = flags;
+    n->offset = offset;
+    n->f = f;
+    filedup(f);
+
+    return n->start;
+  }
+  else {
+    slab_free_node(n);
+    return -1;
+  }
 }
 
 int
