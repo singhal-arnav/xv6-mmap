@@ -92,10 +92,24 @@ sys_uptime(void)
   return xticks;
 }
 
+static struct mmap_node*
+create_mmap_node(int start, int end, int prot, int flags, int offset, struct file *f, struct mmap_node *next)
+{
+  struct mmap_node *node = slab_alloc_node();
+  node->start = start;
+  node->end = end;
+  node->prot = prot;
+  node->flags = flags;
+  node->offset = offset;
+  node->f = f;
+  node->next = next;
+  filedup(f);
+  return node;
+}
+
 int
 sys_mmap(void)
 {
-  cprintf("sys_mmap called!\n");
   void *addr;
   int length, prot, flags, fd, offset;
   struct file *f;
@@ -112,56 +126,55 @@ sys_mmap(void)
   if(argint(5, &offset) < 0)
     return -1;
 
+  if(fd < 0 || fd >= NOFILE)
+    return -1;
+
   f = myproc()->ofile[fd];
+  if(!f)
+    return -1;
 
   if((int)addr >= KERNBASE)
-    return 0;
-
-  struct mmap_node *n, *p;
-
-  p = myproc()->mmap_region;
-  while(p && p->next) {
-    if((p->next->start - p->end - 1) >= length) {
-      n = slab_alloc_node();
-      n->start = p->end + 1;
-      n->end = PGROUNDUP(n->start + length) - 1;
-
-      n->prot = prot;
-      n->flags = flags;
-      n->offset = offset;
-      n->f = f;
-      filedup(f);
-
-      n->next = p->next;
-      p->next = n;
-      return n->start;
-    }
-    p = p->next;
-  }
-
-  n = slab_alloc_node();
-  if(!p)
-    n->start = PGROUNDDOWN(KERNBASE - length);
-  else
-    n->start = PGROUNDDOWN(myproc()->mmap_region->start - length);
-
-  if(n->start >= myproc()->sz) {
-    n->end = PGROUNDUP(n->start + length) - 1;
-    n->next = myproc()->mmap_region;
-    myproc()->mmap_region = n;
-
-    n->prot = prot;
-    n->flags = flags;
-    n->offset = offset;
-    n->f = f;
-    filedup(f);
-
-    return n->start;
-  }
-  else {
-    slab_free_node(n);
     return -1;
+
+  length = PGROUNDUP(length);
+  if(length <= 0)
+    return -1;
+
+  struct mmap_node *new_node, *curr, *prev;
+
+  if(!myproc()->mmap_region){
+    if(length > KERNBASE - myproc()->sz)
+      return -1;
+    new_node = create_mmap_node(KERNBASE - length, KERNBASE - 1, prot, flags, offset, f, 0);
+    myproc()->mmap_region = new_node;
+    return new_node->start;
   }
+
+  curr = myproc()->mmap_region;
+  if(length <= KERNBASE - curr->end - 1){
+    new_node = create_mmap_node(KERNBASE - length, KERNBASE - 1, prot, flags, offset, f, curr);
+    myproc()->mmap_region = new_node;
+    return new_node->start;
+  }
+
+  prev = curr;
+  curr = curr->next;
+  while(curr){
+    if(length <= prev->start - curr->end - 1){
+      new_node = create_mmap_node(prev->start - length, prev->start - 1, prot, flags, offset, f, curr);
+      prev->next = new_node;
+      return new_node->start;
+    }
+    prev = curr;
+    curr = curr->next;
+  }
+
+  if(length <= prev->start - myproc()->sz){
+    new_node = create_mmap_node(prev->start - length, prev->start - 1, prot, flags, offset, f, 0);
+    prev->next = new_node;
+    return new_node->start;
+  }
+  return -1;
 }
 
 int
