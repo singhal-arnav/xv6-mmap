@@ -180,10 +180,29 @@ sys_mmap(void)
 int
 sys_munmap(void)
 {
-  cprintf("sys_munmap called!\n");
-  void *addr;
+  int addr;
   int length;
-  if(argptr(0, (char**)&addr, sizeof(void *)) < 0) return -1;
-  if(argint(1, &length) < 0) return -1;
-  return 0;
+  if(argint(0, &addr) < 0)
+    return -1;
+  if(argint(1, &length) < 0)
+    return -1;
+
+  struct mmap_node *curr, *prev;
+  curr = myproc()->mmap_region;
+  prev = 0;
+
+  while(curr){
+    if(curr->start == addr){
+      if(!prev)
+        myproc()->mmap_region = curr->next;
+      else
+        prev->next = curr->next;
+      fileclose(curr->f);
+      slab_free_node(curr);
+      return 0;
+    }
+    prev = curr;
+    curr = curr->next;
+  }
+  return -1;
 }
