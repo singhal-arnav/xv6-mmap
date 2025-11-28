@@ -6,6 +6,9 @@
 #include "mmu.h"
 #include "proc.h"
 #include "elf.h"
+#include "fcntl.h"
+#include "file.h"
+#include "spinlock.h"
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
@@ -77,6 +80,44 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
     pa += PGSIZE;
   }
   return 0;
+}
+
+int
+page_fault_handler(struct proc *p, uint va)
+{
+  va = PGROUNDDOWN(va);
+  if(va >= p->sz && va < KERNBASE) {
+    struct mmap_node *m = p->mmap_region;
+    while(m){
+      if(va >= m->start && va <= m->end)
+        break;
+      m = m->next;
+    }
+    if(!m)
+      return -1;
+
+    int page_index = (va - m->start) / PGSIZE;
+    int file_offset = m->offset + page_index * PGSIZE;
+    char *mem = kalloc();
+    if(!mem)
+      return -1;
+    ilock(m->f->ip);
+    readi(m->f->ip, mem, file_offset, PGSIZE);
+    iunlock(m->f->ip);
+
+    int flags = PTE_U;
+    if(m->prot & PROT_WRITE)
+      flags |= PTE_W;
+    if(mappages(p->pgdir, (char*)va, PGSIZE, V2P(mem), flags) < 0) {
+      kfree(mem);
+      return -1;
+    }
+    acquire(&m->f->ip->mappings.lock);
+    add_mapping(m->f->ip, (uint)mem, file_offset);
+    release(&m->f->ip->mappings.lock);
+    return 0;
+  }
+  return -1;
 }
 
 // There is one page table per process, plus one that's used when

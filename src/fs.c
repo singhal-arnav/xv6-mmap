@@ -176,6 +176,8 @@ iinit(int dev)
   initlock(&icache.lock, "icache");
   for(i = 0; i < NINODE; i++) {
     initsleeplock(&icache.inode[i].lock, "inode");
+    initlock(&icache.inode[i].mappings.lock, "inodemappings");
+    icache.inode[i].mappings.head = 0;
   }
 
   readsb(dev, &sb);
@@ -266,6 +268,7 @@ iget(uint dev, uint inum)
   ip->inum = inum;
   ip->ref = 1;
   ip->valid = 0;
+  (ip->mappings).head = 0;
   release(&icache.lock);
 
   return ip;
@@ -467,11 +470,28 @@ readi(struct inode *ip, char *dst, uint off, uint n)
     n = ip->size - off;
 
   for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
+    int hit = 0;
+    acquire(&ip->mappings.lock);
+    for(struct imap_node *mn = ip->mappings.head; mn; mn = mn->next){
+      if(off >= mn->offset && off < mn->offset + PGSIZE){
+        uint in_page_off = off - mn->offset;
+        m = min(n - tot, PGSIZE - in_page_off);
+        memmove(dst, (char*)mn->pa + in_page_off, m);
+        hit = 1;
+        break;
+      }
+    }
+    release(&ip->mappings.lock);
+
+    if(hit)
+      continue;
+
     bp = bread(ip->dev, bmap(ip, off/BSIZE));
     m = min(n - tot, BSIZE - off%BSIZE);
     memmove(dst, bp->data + off%BSIZE, m);
     brelse(bp);
   }
+
   return n;
 }
 
@@ -496,11 +516,122 @@ writei(struct inode *ip, char *src, uint off, uint n)
     return -1;
 
   for(tot=0; tot<n; tot+=m, off+=m, src+=m){
-    bp = bread(ip->dev, bmap(ip, off/BSIZE));
-    m = min(n - tot, BSIZE - off%BSIZE);
-    memmove(bp->data + off%BSIZE, src, m);
-    log_write(bp);
-    brelse(bp);
+    // We will handle writes at page granularity for the page cache:
+    uint page_base = PGROUNDDOWN(off);
+    uint in_page_off = off - page_base;
+    m = min(n - tot, PGSIZE - in_page_off);
+
+    // Try to find a cached page for this page_base
+    struct imap_node *mn = 0;
+    acquire(&ip->mappings.lock);
+    for(mn = ip->mappings.head; mn; mn = mn->next){
+      if(mn->offset == page_base)
+        break;
+    }
+
+    if(mn) {
+      // Page already in memory: copy into kernel page
+      memmove((char*)mn->pa + in_page_off, src, m);
+      // Release mapping lock and then write-through to disk the affected blocks
+      release(&ip->mappings.lock);
+
+      // Write through affected blocks so original behavior is preserved
+      // For each block overlapping [page_base + in_page_off, page_base + in_page_off + m)
+      uint write_start = page_base + in_page_off;
+      uint write_end = write_start + m; // exclusive
+      for(uint offb = write_start; offb < write_end; ){
+        uint bno = offb / BSIZE;
+        bp = bread(ip->dev, bmap(ip, bno));
+        uint boff = offb % BSIZE;
+        uint bytes = min(write_end - offb, BSIZE - boff);
+        // copy from page to block buffer
+        memmove(bp->data + boff, (char*)mn->pa + (offb - page_base), bytes);
+        log_write(bp);
+        brelse(bp);
+        offb += bytes;
+      }
+      continue;
+    } else {
+      // No cached page: allocate one, populate from disk (for the page), add mapping,
+      // then copy our write into it and write-through to disk.
+      release(&ip->mappings.lock);
+
+      char *kpage = kalloc();
+      if(!kpage){
+        return -1;
+      }
+
+      // initialize kpage from disk: read page-sized data from file into kpage
+      // (partial pages must be read from disk; if page beyond file size, zero)
+      for(uint offb = 0; offb < PGSIZE; offb += BSIZE){
+        uint file_off = page_base + offb;
+        if(file_off >= ip->size){
+          // beyond EOF: zero remainder
+          memset(kpage + offb, 0, BSIZE);
+        }
+        else {
+          uint bno = file_off / BSIZE;
+          bp = bread(ip->dev, bmap(ip, bno));
+          uint copy_start = file_off % BSIZE;
+          uint bytes = min(BSIZE, ip->size - file_off);
+          // copy bytes starting at copy_start in block into our page at offb
+          memmove(kpage + offb, bp->data + copy_start, bytes);
+          if(bytes < BSIZE)
+            memset(kpage + offb + bytes, 0, BSIZE - bytes);
+          brelse(bp);
+        }
+      }
+
+      acquire(&ip->mappings.lock);
+      // check if another process added the page while we were released
+      for(mn = ip->mappings.head; mn; mn = mn->next){
+        if(mn->offset == page_base)
+          break;
+      }
+      if(mn){
+        kfree(kpage);
+        memmove((char*)mn->pa + in_page_off, src, m);
+        release(&ip->mappings.lock);
+        // Fall through to write blocks
+      } else {
+        // insert mapping node
+        // caller holds ip->mappings.lock now
+        if(add_mapping(ip, (uint)kpage, page_base) < 0) {
+          // failed to add mapping
+          kfree(kpage);
+          release(&ip->mappings.lock);
+          return -1;
+        }
+        // find the newly added node pointer again (cheap scan)
+        mn = ip->mappings.head;
+        while(mn && mn->offset != page_base) mn = mn->next;
+        // copy the desired bytes into the cached page
+        memmove(kpage + in_page_off, src, m);
+        release(&ip->mappings.lock);
+      }
+      mn = ip->mappings.head;
+      while(mn && mn->offset != page_base) mn = mn->next;
+      // copy the desired bytes into the cached page
+      memmove(kpage + in_page_off, src, m);
+      release(&ip->mappings.lock);
+
+      // write-through to disk the affected blocks overlapping our written range
+      uint write_start = page_base + in_page_off;
+      uint write_end = write_start + m; // exclusive
+      for(uint offb = write_start; offb < write_end; ){
+        uint bno = offb / BSIZE;
+        bp = bread(ip->dev, bmap(ip, bno));
+        uint boff = offb % BSIZE;
+        uint bytes = min(write_end - offb, BSIZE - boff);
+        // source in kpage: offset (offb - page_base)
+        memmove(bp->data + boff, kpage + (offb - page_base), bytes);
+        log_write(bp);
+        brelse(bp);
+        offb += bytes;
+      }
+
+      continue;
+    }
   }
 
   if(n > 0 && off > ip->size){
@@ -667,4 +798,82 @@ struct inode*
 nameiparent(char *path, char *name)
 {
   return namex(path, 1, name);
+}
+
+int
+add_mapping(struct inode *ip, uint addr, uint offset) {
+  struct imap_node *p = (ip->mappings).head, *prev = 0;
+  while(p) {
+    prev = p;
+    if(p->pa == addr)
+      return 0;
+    p = p->next;
+  }
+  struct imap_node *n = islab_alloc_node();
+  if(n == 0)
+    return -1;
+  n->pa = addr;
+  n->offset = offset;
+  n->next = 0;
+  if(!(ip->mappings).head)
+    (ip->mappings).head = n;
+  else
+    prev->next = n;
+  return 0;
+}
+
+static struct {
+  struct spinlock lock;
+  void *freelist;
+} imap_node_cache;
+
+void
+islab_init(void)
+{
+  initlock(&imap_node_cache.lock, "imapcache");
+  imap_node_cache.freelist = 0;
+  islab_add_page();
+}
+
+struct imap_node*
+islab_alloc_node(void)
+{
+  struct imap_node *n;
+
+  acquire(&imap_node_cache.lock);
+  if(!imap_node_cache.freelist)
+    islab_add_page();
+  n = imap_node_cache.freelist;
+  if(n) {
+    imap_node_cache.freelist = n->next;
+    n->next = 0;
+    release(&imap_node_cache.lock);
+    return n;
+  }
+  release(&imap_node_cache.lock);
+
+  return 0;
+}
+
+void
+islab_free_node(struct imap_node *n)
+{
+  acquire(&imap_node_cache.lock);
+  n->next = imap_node_cache.freelist;
+  imap_node_cache.freelist = n;
+  release(&imap_node_cache.lock);
+}
+
+void
+islab_add_page(void)
+{
+  char *page = kalloc();
+  if(!page)
+    return;
+  int n = PGSIZE / sizeof(struct imap_node);
+  for(int i = 0; i < n; i++) {
+    struct imap_node *n = (struct imap_node*)page + i;
+    n->next = imap_node_cache.freelist;
+    imap_node_cache.freelist = n;
+  }
 }
