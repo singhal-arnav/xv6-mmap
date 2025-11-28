@@ -34,6 +34,17 @@ struct context {
 
 enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+// Metadata of each mmap region in process's virtual memory
+struct mmap_node {
+  uint start;
+  uint end;
+  int prot;
+  int flags;
+  struct file *f;
+  uint offset;
+  struct mmap_node *next;
+};
+
 // Per-process state
 struct proc {
   uint sz;                     // Size of process memory (bytes)
@@ -49,6 +60,7 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct mmap_node *mmap_region;    // Linked list containing process's virtual memory map
 };
 
 // Process memory is laid out contiguously, low addresses first:

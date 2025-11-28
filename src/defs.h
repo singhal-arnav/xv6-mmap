@@ -9,6 +9,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct mmap_node;
 
 // bio.c
 void            binit(void);
@@ -52,6 +53,11 @@ struct inode*   nameiparent(char*, char*);
 int             readi(struct inode*, char*, uint, uint);
 void            stati(struct inode*, struct stat*);
 int             writei(struct inode*, char*, uint, uint);
+int             add_mapping(struct inode*, uint, uint);
+void            islab_init(void);
+struct imap_node*  islab_alloc_node(void);
+void            islab_free_node(struct imap_node*);
+void            islab_add_page(void);
 
 // ide.c
 void            ideinit(void);
@@ -120,6 +126,10 @@ void            userinit(void);
 int             wait(void);
 void            wakeup(void*);
 void            yield(void);
+void            slab_init(void);
+struct mmap_node*  slab_alloc_node(void);
+void            slab_free_node(struct mmap_node*);
+void            slab_add_page(void);
 
 // swtch.S
 void            swtch(struct context**, struct context*);
@@ -185,6 +195,7 @@ void            switchuvm(struct proc*);
 void            switchkvm(void);
 int             copyout(pde_t*, uint, void*, uint);
 void            clearpteu(pde_t *pgdir, char *uva);
+int             page_fault_handler(struct proc *p, uint va);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
