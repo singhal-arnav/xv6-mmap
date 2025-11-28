@@ -13,6 +13,8 @@ struct imap_node {
   uint pa;
   int refs;
   int dirty;
+  int private;
+  struct proc *p;
   // int cow;
   struct imap_node *next;
 };

@@ -673,19 +673,24 @@ nameiparent(char *path, char *name)
 }
 
 int
-add_mapping(struct inode *ip, uint addr, uint offset) {
-  struct imap_node *p = (ip->mappings).head, *prev = 0;
-  while(p) {
-    prev = p;
-    if(p->pa == addr)
+add_mapping(struct inode *ip, uint addr, uint offset, int private, struct proc *p) {
+  struct imap_node *curr = (ip->mappings).head, *prev = 0;
+  while(curr) {
+    prev = curr;
+    if(curr->pa == addr) {
+      curr->refs++;
       return 0;
-    p = p->next;
+    }
+    curr = curr->next;
   }
   struct imap_node *n = islab_alloc_node();
   if(n == 0)
     return -1;
   n->pa = addr;
   n->offset = offset;
+  n->private = private;
+  n->p = p;
+  n->refs = 1;
   n->next = 0;
   if(!(ip->mappings).head)
     (ip->mappings).head = n;
