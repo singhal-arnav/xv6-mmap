@@ -470,11 +470,29 @@ readi(struct inode *ip, char *dst, uint off, uint n)
     n = ip->size - off;
 
   for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
+    int hit = 0;
+    acquire(&ip->mappings.lock);
+    for(struct imap_node *mn = ip->mappings.head; mn; mn = mn->next){
+      uint page_base = PGROUNDDOWN(mn->offset);
+      if(off >= page_base && off < page_base + PGSIZE){
+        uint in_page_off = off - page_base;
+        m = min(n - tot, PGSIZE - in_page_off);
+        memmove(dst, (char*)(mn->pa) + in_page_off, m);
+        hit = 1;
+        break;
+      }
+    }
+    release(&ip->mappings.lock);
+
+    if(hit)
+      continue;
+
     bp = bread(ip->dev, bmap(ip, off/BSIZE));
     m = min(n - tot, BSIZE - off%BSIZE);
     memmove(dst, bp->data + off%BSIZE, m);
     brelse(bp);
   }
+
   return n;
 }
 
@@ -499,11 +517,31 @@ writei(struct inode *ip, char *src, uint off, uint n)
     return -1;
 
   for(tot=0; tot<n; tot+=m, off+=m, src+=m){
-    bp = bread(ip->dev, bmap(ip, off/BSIZE));
-    m = min(n - tot, BSIZE - off%BSIZE);
-    memmove(bp->data + off%BSIZE, src, m);
-    log_write(bp);
-    brelse(bp);
+    uint page_base = PGROUNDDOWN(off);
+    uint in_page_off = off - page_base;
+    m = min(n - tot, PGSIZE - in_page_off);
+
+    int wrote_to_mapping = 0;
+    acquire(&ip->mappings.lock);
+    for(struct imap_node *mn = ip->mappings.head; mn; mn = mn->next){
+      if(PGROUNDDOWN(mn->offset) == page_base) {
+        memmove((char*)(mn->pa) + in_page_off, src, m);
+        mn->dirty = 1;
+        wrote_to_mapping = 1;
+        break;
+      }
+    }
+    release(&ip->mappings.lock);
+
+    if(!wrote_to_mapping) {
+      bp = bread(ip->dev, bmap(ip, off/BSIZE));
+      uint boff = off % BSIZE;
+      uint to_write = min(n - tot, BSIZE - boff);
+      memmove(bp->data + boff, src, to_write);
+      log_write(bp);
+      brelse(bp);
+      m = to_write;
+    }
   }
 
   if(n > 0 && off > ip->size){
