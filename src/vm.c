@@ -7,8 +7,10 @@
 #include "proc.h"
 #include "elf.h"
 #include "fcntl.h"
-#include "file.h"
 #include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
