@@ -6,6 +6,11 @@
 #include "memlayout.h"
 #include "mmu.h"
 #include "proc.h"
+#include "fcntl.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct file;
 
@@ -126,12 +131,31 @@ sys_mmap(void)
   if(argint(5, &offset) < 0)
     return -1;
 
-  if(fd < 0 || fd >= NOFILE)
+  if(prot & ~(PROT_NONE | PROT_READ | PROT_WRITE | PROT_EXEC))
+    return -1;
+  if(flags & ~(MAP_FILE | MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS))
     return -1;
 
-  f = myproc()->ofile[fd];
-  if(!f)
+  /* POSIX requirement that both can't come together */
+  int shared_private = (flags & MAP_SHARED) | (flags & MAP_PRIVATE);
+  if(shared_private == 0 || shared_private == (MAP_SHARED | MAP_PRIVATE))
     return -1;
+
+  if(!(flags & MAP_ANONYMOUS)){
+    if(fd < 0 || fd >= NOFILE)
+      return -1;
+
+    f = myproc()->ofile[fd];
+    if(!f)
+      return -1;
+
+    if((prot & PROT_READ) && !f->readable)
+      return -1;
+    if((prot & PROT_WRITE) && !f->writable)
+      return -1;
+  }
+  else
+    f = 0;
 
   if((int)addr >= KERNBASE)
     return -1;
