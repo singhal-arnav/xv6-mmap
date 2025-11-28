@@ -200,7 +200,6 @@ sys_munmap(void)
     if(curr->start < end_addr && curr->end >= addr){
       if(addr <= curr->start && end_addr > curr->end){
         free_pages_in_range(curproc->pgdir, curr->start, curr->end);
-        remove_mmap_node(&curproc->mmap_region, prev, curr);
         if(!prev)
           curproc->mmap_region = curr->next;
         else
