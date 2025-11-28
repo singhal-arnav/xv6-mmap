@@ -81,6 +81,10 @@ trap(struct trapframe *tf)
     uint fault_addr = rcr2();
     if(page_fault_handler(myproc(), fault_addr) == 0)
       return;
+    cprintf("pid %d %s: invalid memory access (protection violation) at address 0x%x, PROCESS TERMINATED\n",
+            myproc()->pid, myproc()->name, fault_addr);
+    myproc()->killed = 1;
+    break;
 
   //PAGEBREAK: 13
   default:

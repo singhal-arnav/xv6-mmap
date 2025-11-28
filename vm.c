@@ -404,15 +404,27 @@ page_fault_handler(struct proc *p, uint va)
     if(!m)
       return -1;
 
+    pte_t *pte = walkpgdir(p->pgdir, (char*)va, 0);
+    if(pte && (*pte & PTE_P))
+      return -1;
+
+    if(m->prot == PROT_NONE)
+      return -1;
+
     int page_index = (va - m->start) / PGSIZE;
     int file_offset = m->offset + page_index * PGSIZE;
     char *mem = kalloc();
     if(!mem)
       return -1;
-    ilock(m->f->ip);
-    readi(m->f->ip, mem, file_offset, PGSIZE);
-    iunlock(m->f->ip);
 
+    memset(mem, 0, PGSIZE);
+    if(m->prot & PROT_READ){
+      ilock(m->f->ip);
+      readi(m->f->ip, mem, file_offset, PGSIZE);
+      iunlock(m->f->ip);
+    }
+
+    /* NOTE: PROT_EXEC deoesn't need special handling, since it can't be enforced */
     int flags = PTE_U;
     if(m->prot & PROT_WRITE)
       flags |= PTE_W;
