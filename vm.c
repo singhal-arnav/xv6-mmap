@@ -411,49 +411,64 @@ page_fault_handler(struct proc *p, uint va)
     if(m->prot == PROT_NONE)
       return -1;
 
-    char *mem = kalloc();
-    if(!mem)
-      return -1;
-    memset(mem, 0, PGSIZE);
+    char *mem = 0;
 
     if(!(m->flags & MAP_ANONYMOUS)) {
       int page_index = (va - m->start) / PGSIZE;
       int file_offset = m->offset + page_index * PGSIZE;
-      int private = (m->flags & MAP_PRIVATE) ? 1 : 0;
-      struct proc *proc_ref = private ? p : 0;
-      struct imap_node *mn = 0;
+      int is_private = (m->flags & MAP_PRIVATE) ? 1 : 0;
 
       acquire(&m->f->ip->mappings.lock);
-      for(mn = m->f->ip->mappings.head; mn; mn = mn->next){
-        if(mn->offset == file_offset){
-          if(!private && !mn->private) {
-             kfree(mem);
-             mem = (char*)mn->pa;
-             mn->refs++;
-             release(&m->f->ip->mappings.lock);
-             goto map;
+      
+      struct imap_node *mn = 0;
+      if(!is_private) {
+        for(mn = m->f->ip->mappings.head; mn; mn = mn->next){
+          if(mn->offset == file_offset && !mn->private) {
+            mem = (char*)P2V(mn->pa);
+            mn->refs++;
+            release(&m->f->ip->mappings.lock);
+            goto map;
           }
         }
       }
-
+      
       release(&m->f->ip->mappings.lock);
+
+      mem = kalloc();
+      if(!mem)
+        return -1;
+      memset(mem, 0, PGSIZE);
 
       ilock(m->f->ip);
       readi(m->f->ip, mem, file_offset, PGSIZE);
       iunlock(m->f->ip);
 
       acquire(&m->f->ip->mappings.lock);
-      add_mapping(m->f->ip, (uint)mem, file_offset, private, proc_ref);
+      if(add_mapping(m->f->ip, (uint)mem, file_offset, is_private, is_private ? p : 0) < 0) {
+        release(&m->f->ip->mappings.lock);
+        kfree(mem);
+        return -1;
+      }
       release(&m->f->ip->mappings.lock);
+    } 
+    else {
+      mem = kalloc();
+      if(!mem)
+        return -1;
+      memset(mem, 0, PGSIZE);
     }
 
 map:
-
-    /* NOTE: PROT_EXEC deoesn't need special handling, since it can't be enforced */
     int flags = PTE_U;
     if(m->prot & PROT_WRITE)
       flags |= PTE_W;
+    
     if(mappages(p->pgdir, (char*)va, PGSIZE, V2P(mem), flags) < 0) {
+      if(!(m->flags & MAP_ANONYMOUS)) {
+        acquire(&m->f->ip->mappings.lock);
+        remove_mapping_ref(m->f->ip, V2P(mem), (m->flags & MAP_PRIVATE) ? p : 0);
+        release(&m->f->ip->mappings.lock);
+      }
       kfree(mem);
       return -1;
     }
@@ -465,10 +480,25 @@ map:
 void
 free_pages_in_range(pde_t *pgdir, uint start, uint end)
 {
+  struct proc *p = myproc();
+  
   for(uint va = PGROUNDDOWN(start); va <= PGROUNDDOWN(end); va += PGSIZE){
     pte_t *pte = walkpgdir(pgdir, (char*)va, 0);
     if(pte && (*pte & PTE_P)){
       uint pa = PTE_ADDR(*pte);
+      
+      struct mmap_node *m = p->mmap_region;
+      while(m) {
+        if(va >= m->start && va <= m->end && !(m->flags & MAP_ANONYMOUS)) {
+          //int page_offset = m->offset + ((va - m->start) / PGSIZE) * PGSIZE;
+          acquire(&m->f->ip->mappings.lock);
+          remove_mapping_ref(m->f->ip, pa, (m->flags & MAP_PRIVATE) ? p : 0);
+          release(&m->f->ip->mappings.lock);
+          break;
+        }
+        m = m->next;
+      }
+      
       kfree(P2V(pa));
       *pte = 0;
     }

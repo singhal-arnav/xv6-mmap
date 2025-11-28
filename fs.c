@@ -673,30 +673,58 @@ nameiparent(char *path, char *name)
 }
 
 int
-add_mapping(struct inode *ip, uint addr, uint offset, int private, struct proc *p) {
-  struct imap_node *curr = (ip->mappings).head, *prev = 0;
+add_mapping(struct inode *ip, uint pa, uint offset, int private, struct proc *p)
+{
+  struct imap_node *curr = (ip->mappings).head;
+
   while(curr) {
-    prev = curr;
-    if(curr->pa == addr) {
+    if(curr->pa == pa && curr->offset == offset) {
       curr->refs++;
       return 0;
     }
     curr = curr->next;
   }
+
   struct imap_node *n = islab_alloc_node();
   if(n == 0)
     return -1;
-  n->pa = addr;
+
+  n->pa = pa;
   n->offset = offset;
   n->private = private;
   n->p = p;
   n->refs = 1;
-  n->next = 0;
-  if(!(ip->mappings).head)
-    (ip->mappings).head = n;
-  else
-    prev->next = n;
+  n->dirty = 0;
+  n->next = (ip->mappings).head;
+  (ip->mappings).head = n;
+
   return 0;
+}
+
+void
+remove_mapping_ref(struct inode *ip, uint pa, struct proc *p)
+{
+  struct imap_node *curr = (ip->mappings).head;
+  struct imap_node *prev = 0;
+
+  while(curr) {
+    if(curr->pa == pa && (curr->private == 0 || curr->p == p)) {
+      curr->refs--;
+
+      if(curr->refs <= 0) {
+        if(prev)
+          prev->next = curr->next;
+        else
+          (ip->mappings).head = curr->next;
+
+        islab_free_node(curr);
+        return;
+      }
+      return;
+    }
+    prev = curr;
+    curr = curr->next;
+  }
 }
 
 static struct {

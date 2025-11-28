@@ -101,6 +101,8 @@ static struct mmap_node*
 create_mmap_node(int start, int end, int prot, int flags, int offset, struct file *f, struct mmap_node *next)
 {
   struct mmap_node *node = slab_alloc_node();
+  if(!node)
+    return 0;
   node->start = start;
   node->end = end;
   node->prot = prot;
@@ -119,6 +121,7 @@ sys_mmap(void)
   void *addr;
   int length, prot, flags, fd, offset;
   struct file *f;
+  
   if(argptr(0, (char **)&addr, sizeof(void *)) < 0)
     return -1;
   if(argint(1, &length) < 0)
@@ -134,6 +137,7 @@ sys_mmap(void)
 
   if(prot & ~(PROT_NONE | PROT_READ | PROT_WRITE | PROT_EXEC))
     return -1;
+    
   if(flags & ~(MAP_FILE | MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS))
     return -1;
 
@@ -152,11 +156,11 @@ sys_mmap(void)
 
     if((prot & PROT_READ) && !f->readable)
       return -1;
-    if((prot & PROT_WRITE) && !f->writable)
+    if((prot & PROT_WRITE) && (flags & MAP_SHARED) && !f->writable)
       return -1;
-  }
-  else
+  } else {
     f = 0;
+  }
 
   if((int)addr >= KERNBASE)
     return -1;
@@ -166,19 +170,24 @@ sys_mmap(void)
     return -1;
 
   struct mmap_node *new_node, *curr, *prev;
+  struct proc *p = myproc();
 
-  if(!myproc()->mmap_region){
-    if(length > KERNBASE - myproc()->sz)
+  if(!p->mmap_region){
+    if(length > KERNBASE - p->sz)
       return -1;
     new_node = create_mmap_node(KERNBASE - length, KERNBASE - 1, prot, flags, offset, f, 0);
-    myproc()->mmap_region = new_node;
+    if(!new_node)
+      return -1;
+    p->mmap_region = new_node;
     return new_node->start;
   }
 
-  curr = myproc()->mmap_region;
+  curr = p->mmap_region;
   if(length <= KERNBASE - curr->end - 1){
     new_node = create_mmap_node(KERNBASE - length, KERNBASE - 1, prot, flags, offset, f, curr);
-    myproc()->mmap_region = new_node;
+    if(!new_node)
+      return -1;
+    p->mmap_region = new_node;
     return new_node->start;
   }
 
@@ -187,6 +196,8 @@ sys_mmap(void)
   while(curr){
     if(length <= prev->start - curr->end - 1){
       new_node = create_mmap_node(prev->start - length, prev->start - 1, prot, flags, offset, f, curr);
+      if(!new_node)
+        return -1;
       prev->next = new_node;
       return new_node->start;
     }
@@ -194,11 +205,14 @@ sys_mmap(void)
     curr = curr->next;
   }
 
-  if(length <= prev->start - myproc()->sz){
+  if(length <= prev->start - p->sz){
     new_node = create_mmap_node(prev->start - length, prev->start - 1, prot, flags, offset, f, 0);
+    if(!new_node)
+      return -1;
     prev->next = new_node;
     return new_node->start;
   }
+  
   return -1;
 }
 
@@ -207,6 +221,7 @@ sys_munmap(void)
 {
   int addr;
   int length;
+  
   if(argint(0, &addr) < 0)
     return -1;
   if(argint(1, &length) < 0)
@@ -222,14 +237,19 @@ sys_munmap(void)
 
   while(curr){
     next = curr->next;
+    
     if(curr->start < end_addr && curr->end >= addr){
+      
       if(addr <= curr->start && end_addr > curr->end){
         free_pages_in_range(curproc->pgdir, curr->start, curr->end);
+        
         if(!prev)
           curproc->mmap_region = curr->next;
         else
           prev->next = curr->next;
-        fileclose(curr->f);
+          
+        if(curr->f)
+          fileclose(curr->f);
         slab_free_node(curr);
         curr = next;
         continue;
@@ -250,7 +270,11 @@ sys_munmap(void)
       else if(addr > curr->start && end_addr <= curr->end){
         free_pages_in_range(curproc->pgdir, addr, end_addr - 1);
         int new_offset = curr->offset + (end_addr - curr->start);
-        struct mmap_node *new_node = create_mmap_node(end_addr, curr->end, curr->prot, curr->flags, new_offset, curr->f, curr->next);
+        struct mmap_node *new_node = create_mmap_node(end_addr, curr->end, 
+                                                      curr->prot, curr->flags, 
+                                                      new_offset, curr->f, curr->next);
+        if(!new_node)
+          return -1;
         curr->end = addr - 1;
         curr->next = new_node;
       }
@@ -258,6 +282,7 @@ sys_munmap(void)
     prev = curr;
     curr = next;
   }
+  
   cleanup_empty_pagetables(curproc->pgdir, addr, end_addr);
   return 0;
 }
