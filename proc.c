@@ -24,6 +24,7 @@ void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
+  slab_init();
 }
 
 // Must be called with interrupts disabled
