@@ -425,6 +425,45 @@ page_fault_handler(struct proc *p, uint va)
   return -1;
 }
 
+void
+free_pages_in_range(pde_t *pgdir, uint start, uint end)
+{
+  for(uint va = PGROUNDDOWN(start); va <= PGROUNDDOWN(end); va += PGSIZE){
+    pte_t *pte = walkpgdir(pgdir, (char*)va, 0);
+    if(pte && (*pte & PTE_P)){
+      uint pa = PTE_ADDR(*pte);
+      kfree(P2V(pa));
+      *pte = 0;
+    }
+  }
+}
+
+void
+cleanup_empty_pagetables(pde_t *pgdir, uint start, uint end)
+{
+  uint pde_start = PDX(start);
+  uint pde_end = PDX(end);
+
+  for(uint i = pde_start; i <= pde_end; i++){
+    if(pgdir[i] & PTE_P){
+      pte_t *pgtab = (pte_t*)P2V(PTE_ADDR(pgdir[i]));
+      int has_valid_pte = 0;
+
+      for(int j = 0; j < NPTENTRIES; j++){
+        if(pgtab[j] & PTE_P){
+          has_valid_pte = 1;
+          break;
+        }
+      }
+
+      if(!has_valid_pte){
+        kfree((char*)pgtab);
+        pgdir[i] = 0;
+      }
+    }
+  }
+}
+
 //PAGEBREAK!
 // Blank page.
 //PAGEBREAK!

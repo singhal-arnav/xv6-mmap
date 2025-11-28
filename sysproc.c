@@ -187,22 +187,53 @@ sys_munmap(void)
   if(argint(1, &length) < 0)
     return -1;
 
-  struct mmap_node *curr, *prev;
-  curr = myproc()->mmap_region;
+  length = PGROUNDUP(length);
+  int end_addr = addr + length;
+
+  struct proc *curproc = myproc();
+  struct mmap_node *curr, *prev, *next;
+  curr = curproc->mmap_region;
   prev = 0;
 
   while(curr){
-    if(curr->start == addr){
-      if(!prev)
-        myproc()->mmap_region = curr->next;
-      else
-        prev->next = curr->next;
-      fileclose(curr->f);
-      slab_free_node(curr);
-      return 0;
+    next = curr->next;
+    if(curr->start < end_addr && curr->end >= addr){
+      if(addr <= curr->start && end_addr > curr->end){
+        free_pages_in_range(curproc->pgdir, curr->start, curr->end);
+        remove_mmap_node(&curproc->mmap_region, prev, curr);
+        if(!prev)
+          curproc->mmap_region = curr->next;
+        else
+          prev->next = curr->next;
+        fileclose(curr->f);
+        slab_free_node(curr);
+        curr = next;
+        continue;
+      }
+
+      else if(addr <= curr->start && end_addr > curr->start && end_addr <= curr->end){
+        free_pages_in_range(curproc->pgdir, curr->start, end_addr - 1);
+        int offset_change = end_addr - curr->start;
+        curr->offset += offset_change;
+        curr->start = end_addr;
+      }
+
+      else if(addr > curr->start && addr <= curr->end && end_addr > curr->end){
+        free_pages_in_range(curproc->pgdir, addr, curr->end);
+        curr->end = addr - 1;
+      }
+
+      else if(addr > curr->start && end_addr <= curr->end){
+        free_pages_in_range(curproc->pgdir, addr, end_addr - 1);
+        int new_offset = curr->offset + (end_addr - curr->start);
+        struct mmap_node *new_node = create_mmap_node(end_addr, curr->end, curr->prot, curr->flags, new_offset, curr->f, curr->next);
+        curr->end = addr - 1;
+        curr->next = new_node;
+      }
     }
     prev = curr;
-    curr = curr->next;
+    curr = next;
   }
-  return -1;
+  cleanup_empty_pagetables(curproc->pgdir, addr, end_addr);
+  return 0;
 }
