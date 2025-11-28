@@ -24,6 +24,7 @@ void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
+  slab_init();
 }
 
 // Must be called with interrupts disabled
@@ -88,6 +89,7 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+  p->mmap_region = 0;
 
   release(&ptable.lock);
 
@@ -530,5 +532,61 @@ procdump(void)
         cprintf(" %p", pc[i]);
     }
     cprintf("\n");
+  }
+}
+
+static struct {
+  struct spinlock lock;
+  void *freelist;
+} mmap_node_cache;
+
+void
+slab_init(void)
+{
+  initlock(&mmap_node_cache.lock, "mmapcache");
+  mmap_node_cache.freelist = 0;
+  slab_add_page();
+}
+
+struct mmap_node*
+slab_alloc_node(void)
+{
+  struct mmap_node *n;
+
+  acquire(&mmap_node_cache.lock);
+  if(!mmap_node_cache.freelist)
+    slab_add_page();
+  n = mmap_node_cache.freelist;
+  if(n) {
+    mmap_node_cache.freelist = n->next;
+    n->next = 0;
+    release(&mmap_node_cache.lock);
+    return n;
+  }
+  release(&mmap_node_cache.lock);
+
+  return 0;
+}
+
+void
+slab_free_node(struct mmap_node *n)
+{
+  acquire(&mmap_node_cache.lock);
+  n->next = mmap_node_cache.freelist;
+  mmap_node_cache.freelist = n;
+  release(&mmap_node_cache.lock);
+}
+
+void
+slab_add_page(void)
+{
+  char *page = kalloc();
+  if(!page)
+    return;
+  int n = PGSIZE / sizeof(struct mmap_node);
+  for(int i = 0; i < n; i++) {
+    struct mmap_node *n = (struct mmap_node*)page + i;
+    n->next = mmap_node_cache.freelist;
+    mmap_node_cache.freelist = n;
   }
 }

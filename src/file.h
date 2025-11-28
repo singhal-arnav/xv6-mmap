@@ -8,12 +8,30 @@ struct file {
   uint off;
 };
 
+struct proc;
+
+struct imap_node {
+  uint offset;
+  uint pa;
+  int refs;
+  int dirty;
+  // int cow;
+  struct imap_node *next;
+  int private;
+  struct proc *p;
+};
+
+struct inode_mappings {
+  struct imap_node *head;
+  struct spinlock lock;
+};
 
 // in-memory copy of an inode
 struct inode {
   uint dev;           // Device number
   uint inum;          // Inode number
   int ref;            // Reference count
+  struct inode_mappings mappings; // Linked list of file mappings in physical memory
   struct sleeplock lock; // protects everything below here
   int valid;          // inode has been read from disk?
 

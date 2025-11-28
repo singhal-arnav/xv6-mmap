@@ -6,6 +6,11 @@
 #include "mmu.h"
 #include "proc.h"
 #include "elf.h"
+#include "fcntl.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
@@ -77,6 +82,82 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
     pa += PGSIZE;
   }
   return 0;
+}
+
+int
+page_fault_handler(struct proc *p, uint va)
+{
+  va = PGROUNDDOWN(va);
+  if(va >= p->sz && va < KERNBASE) {
+    struct mmap_node *m = p->mmap_region;
+    while(m){
+      if(va >= m->start && va <= m->end)
+        break;
+      m = m->next;
+    }
+    if(!m)
+      return -1;
+
+    char *mem = kalloc();
+    if(!mem)
+      return -1;
+    memset(mem, 0, PGSIZE);
+
+    if(!(m->flags & MAP_ANONYMOUS)) {
+      int page_index = (va - m->start) / PGSIZE;
+      int file_offset = m->offset + page_index * PGSIZE;
+      int private = (m->flags & MAP_PRIVATE) ? 1 : 0;
+      struct proc *proc_ref = private ? p : 0;
+      struct imap_node *mn = 0;
+
+      acquire(&m->f->ip->mappings.lock);
+      // Check if page already exists in cache
+      for(mn = m->f->ip->mappings.head; mn; mn = mn->next){
+        if(mn->offset == file_offset){
+          // If strict sharing is required, we should check compatibility?
+          // For now, if we find a page, and we are MAP_SHARED, we reuse it.
+          // If we are MAP_PRIVATE, we should copy on write or make our own.
+          // User spec: MAP_PRIVATE makes its own private entry in inode mappings?
+          // "MAP_PRIVATE sets the private field ... to 1 ... so that at least the current process ... will have coherency"
+          // This implies we create a NEW mapping node for private.
+          // If MAP_SHARED, we reuse existing SHARED mapping node if exists.
+          if(!private && !mn->private) {
+             // Reuse this page
+             kfree(mem); // Free the one we allocated
+             mem = (char*)mn->pa;
+             // Refs++? We don't have refs logic fully implemented but we should.
+             mn->refs++;
+             release(&m->f->ip->mappings.lock);
+             goto map;
+          }
+        }
+      }
+
+      // Not found or not reusable, proceed to load
+      release(&m->f->ip->mappings.lock);
+
+      ilock(m->f->ip);
+      readi(m->f->ip, mem, file_offset, PGSIZE);
+      iunlock(m->f->ip);
+
+      acquire(&m->f->ip->mappings.lock);
+      // Re-check? Assuming simplistic model for now.
+      add_mapping(m->f->ip, (uint)mem, file_offset, private, proc_ref);
+      release(&m->f->ip->mappings.lock);
+    }
+
+map:
+
+    int flags = PTE_U;
+    if(m->prot & PROT_WRITE)
+      flags |= PTE_W;
+    if(mappages(p->pgdir, (char*)va, PGSIZE, V2P(mem), flags) < 0) {
+      kfree(mem);
+      return -1;
+    }
+    return 0;
+  }
+  return -1;
 }
 
 // There is one page table per process, plus one that's used when
@@ -372,8 +453,30 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   while(len > 0){
     va0 = (uint)PGROUNDDOWN(va);
     pa0 = uva2ka(pgdir, (char*)va0);
-    if(pa0 == 0)
-      return -1;
+    if(pa0 == 0) {
+      // Check if it's in mmap region
+      // But uva2ka checks PTE presence. If it returns 0, page is not present or not user.
+      // If mmap page is faulted in, it should be present.
+      // If it's not faulted in, copyout will fail?
+      // Yes, standard xv6 copyout expects pages to be present.
+      // mmap pages are loaded on demand.
+      // If we write to an mmap address via syscall (e.g. read(fd, mmap_addr, len)),
+      // we need to trigger page fault?
+      // xv6 kernel doesn't handle page faults during copyout easily?
+      // Actually trap.c handles T_PGFLT. If it happens in kernel mode (during copyout),
+      // we might need to handle it.
+      // But copyout is carefully written.
+      // Issue: copyout uses uva2ka which checks PTE.
+      // If page is not present, uva2ka returns 0.
+      // We should probably try to fault it in?
+      // But page_fault_handler takes `struct proc*`.
+      // We can call page_fault_handler(myproc(), va0) if uva2ka fails?
+      if(page_fault_handler(myproc(), va0) == 0){
+         pa0 = uva2ka(pgdir, (char*)va0);
+      }
+      if(pa0 == 0)
+        return -1;
+    }
     n = PGSIZE - (va - va0);
     if(n > len)
       n = len;

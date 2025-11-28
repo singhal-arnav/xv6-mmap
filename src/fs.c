@@ -176,7 +176,10 @@ iinit(int dev)
   initlock(&icache.lock, "icache");
   for(i = 0; i < NINODE; i++) {
     initsleeplock(&icache.inode[i].lock, "inode");
+    initlock(&icache.inode[i].mappings.lock, "inodemappings");
+    icache.inode[i].mappings.head = 0;
   }
+  islab_init();
 
   readsb(dev, &sb);
   cprintf("sb: size %d nblocks %d ninodes %d nlog %d logstart %d\
@@ -266,6 +269,7 @@ iget(uint dev, uint inum)
   ip->inum = inum;
   ip->ref = 1;
   ip->valid = 0;
+  (ip->mappings).head = 0;
   release(&icache.lock);
 
   return ip;
@@ -467,11 +471,30 @@ readi(struct inode *ip, char *dst, uint off, uint n)
     n = ip->size - off;
 
   for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
+    int hit = 0;
+    acquire(&ip->mappings.lock);
+    for(struct imap_node *mn = ip->mappings.head; mn; mn = mn->next){
+      if(off >= mn->offset && off < mn->offset + PGSIZE){
+        if(mn->private && mn->p != myproc())
+          continue;
+        uint in_page_off = off - mn->offset;
+        m = min(n - tot, PGSIZE - in_page_off);
+        memmove(dst, (char*)mn->pa + in_page_off, m);
+        hit = 1;
+        break;
+      }
+    }
+    release(&ip->mappings.lock);
+
+    if(hit)
+      continue;
+
     bp = bread(ip->dev, bmap(ip, off/BSIZE));
     m = min(n - tot, BSIZE - off%BSIZE);
     memmove(dst, bp->data + off%BSIZE, m);
     brelse(bp);
   }
+
   return n;
 }
 
@@ -496,11 +519,115 @@ writei(struct inode *ip, char *src, uint off, uint n)
     return -1;
 
   for(tot=0; tot<n; tot+=m, off+=m, src+=m){
-    bp = bread(ip->dev, bmap(ip, off/BSIZE));
-    m = min(n - tot, BSIZE - off%BSIZE);
-    memmove(bp->data + off%BSIZE, src, m);
-    log_write(bp);
-    brelse(bp);
+    // We will handle writes at page granularity for the page cache:
+    uint page_base = PGROUNDDOWN(off);
+    uint in_page_off = off - page_base;
+    m = min(n - tot, PGSIZE - in_page_off);
+
+    // Try to find a cached page for this page_base
+    struct imap_node *mn = 0;
+    acquire(&ip->mappings.lock);
+    for(mn = ip->mappings.head; mn; mn = mn->next){
+      if(mn->offset == page_base){
+        if(mn->private && mn->p != myproc())
+          continue;
+        break;
+      }
+    }
+
+    if(mn) {
+      memmove((char*)mn->pa + in_page_off, src, m);
+      release(&ip->mappings.lock);
+    } else {
+      release(&ip->mappings.lock);
+
+      char *kpage = kalloc();
+      if(!kpage) return -1;
+
+      // Initialize kpage from disk
+      for(uint offb = 0; offb < PGSIZE; offb += BSIZE){
+        uint file_off = page_base + offb;
+        if(file_off >= ip->size){
+          memset(kpage + offb, 0, BSIZE);
+        } else {
+          uint bno = file_off / BSIZE;
+          bp = bread(ip->dev, bmap(ip, bno));
+          uint copy_start = file_off % BSIZE;
+          uint bytes = min(BSIZE, ip->size - file_off);
+          memmove(kpage + offb, bp->data + copy_start, bytes);
+          if(bytes < BSIZE)
+            memset(kpage + offb + bytes, 0, BSIZE - bytes);
+          brelse(bp);
+        }
+      }
+
+      acquire(&ip->mappings.lock);
+      // Re-check race
+      for(mn = ip->mappings.head; mn; mn = mn->next){
+        if(mn->offset == page_base){
+          if(mn->private && mn->p != myproc())
+            continue;
+          break;
+        }
+      }
+
+      if(mn){
+         kfree(kpage);
+         memmove((char*)mn->pa + in_page_off, src, m);
+      } else {
+         if(add_mapping(ip, (uint)kpage, page_base, 0, 0) < 0){
+            kfree(kpage);
+            release(&ip->mappings.lock);
+            return -1;
+         }
+         // Use the newly allocated page address (kpage)
+         memmove(kpage + in_page_off, src, m);
+      }
+      release(&ip->mappings.lock);
+    }
+
+    // Write through to disk the affected blocks
+    uint write_start = page_base + in_page_off;
+    uint write_end = write_start + m; // exclusive
+    for(uint offb = write_start; offb < write_end; ){
+      uint bno = offb / BSIZE;
+      bp = bread(ip->dev, bmap(ip, bno));
+      uint boff = offb % BSIZE;
+      uint bytes = min(write_end - offb, BSIZE - boff);
+
+      // Need to find the page address again if we don't have it handy?
+      // Actually we released the lock, so 'mn' pointer from inside if/else might be invalid if node freed?
+      // But we just added/found it. And we hold reference to inode.
+      // Nodes are not freed unless inode is destroyed or page reclamation (not implemented).
+      // However, safely, we should look up or remember address.
+      // But wait! If we didn't use `mn` in `else` block, how do we know the address?
+      // We know `kpage` if we allocated it. But if we raced and freed `kpage`, we need `mn->pa`.
+      // Let's just lookup the page again to be safe? Or use the address we wrote to.
+
+      // The original code used `memmove` from `kpage`.
+      // But if we raced, `kpage` was freed.
+      // So we need to look up the mapping again to get the physical address?
+      // Accessing `mn->pa` without lock is unsafe if `mn` can be freed.
+      // But here we are just reading from memory address.
+      // If the page is in the cache, it's pinned by `inode` existence?
+      // The `imap_node` is in the list.
+
+      // Let's assume for now we can't easily get the address without lock.
+      // BUT `bread` buffer `bp->data` is where we write TO.
+      // We copy FROM the page cache.
+      // So we need to read from the page cache.
+
+      // Simple solution:
+      // We already have `src`! We can copy from `src` to `bp->data` directly!
+      // We don't need to read from page cache. We are writing `src` to file.
+      // `memmove(bp->data + boff, src + (offb - write_start), bytes);`
+      // `src` is what we passed to `writei`.
+
+      memmove(bp->data + boff, src + (offb - write_start), bytes);
+      log_write(bp);
+      brelse(bp);
+      offb += bytes;
+    }
   }
 
   if(n > 0 && off > ip->size){
@@ -667,4 +794,113 @@ struct inode*
 nameiparent(char *path, char *name)
 {
   return namex(path, 1, name);
+}
+
+int
+add_mapping(struct inode *ip, uint addr, uint offset, int private, struct proc *p) {
+  struct imap_node *curr = (ip->mappings).head, *prev = 0;
+  while(curr) {
+    prev = curr;
+    if(curr->pa == addr) {
+      curr->refs++;
+      return 0;
+    }
+    curr = curr->next;
+  }
+  struct imap_node *n = islab_alloc_node();
+  if(n == 0)
+    return -1;
+  n->pa = addr;
+  n->offset = offset;
+  n->private = private;
+  n->p = p;
+  n->refs = 1;
+  n->next = 0;
+  if(!(ip->mappings).head)
+    (ip->mappings).head = n;
+  else
+    prev->next = n;
+  return 0;
+}
+
+void
+remove_mapping(struct inode *ip, uint addr) {
+  acquire(&ip->mappings.lock);
+  struct imap_node *curr = (ip->mappings).head, *prev = 0;
+  while(curr) {
+    if(curr->pa == addr){
+      curr->refs--;
+      if(curr->refs > 0){
+        release(&ip->mappings.lock);
+        return;
+      }
+      // Remove from list
+      if(prev) prev->next = curr->next;
+      else ip->mappings.head = curr->next;
+
+      islab_free_node(curr);
+      if(!curr->private) kfree(P2V(curr->pa)); // Free shared page if last ref
+      release(&ip->mappings.lock);
+      return;
+    }
+    prev = curr;
+    curr = curr->next;
+  }
+  release(&ip->mappings.lock);
+}
+
+static struct {
+  struct spinlock lock;
+  void *freelist;
+} imap_node_cache;
+
+void
+islab_init(void)
+{
+  initlock(&imap_node_cache.lock, "imapcache");
+  imap_node_cache.freelist = 0;
+  islab_add_page();
+}
+
+struct imap_node*
+islab_alloc_node(void)
+{
+  struct imap_node *n;
+
+  acquire(&imap_node_cache.lock);
+  if(!imap_node_cache.freelist)
+    islab_add_page();
+  n = imap_node_cache.freelist;
+  if(n) {
+    imap_node_cache.freelist = n->next;
+    n->next = 0;
+    release(&imap_node_cache.lock);
+    return n;
+  }
+  release(&imap_node_cache.lock);
+
+  return 0;
+}
+
+void
+islab_free_node(struct imap_node *n)
+{
+  acquire(&imap_node_cache.lock);
+  n->next = imap_node_cache.freelist;
+  imap_node_cache.freelist = n;
+  release(&imap_node_cache.lock);
+}
+
+void
+islab_add_page(void)
+{
+  char *page = kalloc();
+  if(!page)
+    return;
+  int n = PGSIZE / sizeof(struct imap_node);
+  for(int i = 0; i < n; i++) {
+    struct imap_node *n = (struct imap_node*)page + i;
+    n->next = imap_node_cache.freelist;
+    imap_node_cache.freelist = n;
+  }
 }
