@@ -465,6 +465,136 @@ int test_partial_munmap(){
   return 1;
 }
 
+int test_many_mappings() {
+  const char *filename = "test_many.txt";
+  if (create_test_file(filename, "Many", 4096) < 0)
+    return 0;
+
+  int fd = open(filename, O_RDONLY);
+  if (fd < 0) {
+    printf(2, "test_many_mappings: open failed\n");
+    unlink(filename);
+    return 0;
+  }
+
+  #define NUM_MAPS 20
+  void *mappings[NUM_MAPS];
+  int success = 1;
+
+  for (int i = 0; i < NUM_MAPS; i++) {
+    mappings[i] = mmap(0, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    if (mappings[i] == (void *)-1) {
+      printf(2, "test_many_mappings: mmap %d failed\n", i);
+      success = 0;
+      break;
+    }
+  }
+
+  if (success) {
+    for (int i = 0; i < NUM_MAPS; i++) {
+      if (((char *)mappings[i])[0] != 'M') {
+        printf(2, "test_many_mappings: read from mapping %d failed\n", i);
+        success = 0;
+        break;
+      }
+    }
+  }
+
+  for (int i = 0; i < NUM_MAPS; i++) {
+    if (mappings[i] != (void *)-1) {
+      munmap(mappings[i], 4096);
+    }
+  }
+
+  close(fd);
+  unlink(filename);
+  return success;
+}
+
+int test_large_file_mapping() {
+  const char *filename = "test_large.txt";
+  int size = 4096 * 16;
+  
+  if (create_test_file(filename, "LARGE", size) < 0)
+    return 0;
+  
+  int fd = open(filename, O_RDWR);
+  if (fd < 0) {
+    printf(2, "test_large_file_mapping: open failed\n");
+    unlink(filename);
+    return 0;
+  }
+
+  void *mapped = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (mapped == (void *)-1) {
+    printf(2, "test_large_file_mapping: mmap failed\n");
+    close(fd);
+    unlink(filename);
+    return 0;
+  }
+  int success = 1;
+  if (((char *)mapped)[0] != 'L') {
+    success = 0;
+  }
+
+  for (int i = 0; i < 16; i++) {
+    char *page = (char *)mapped + (i * 4096);
+    page[0] = 'A' + i;
+    if (page[0] != 'A' + i) {
+      printf(2, "test_large_file_mapping: page %d access failed\n", i);
+      success = 0;
+      break;
+    }
+  }
+
+  ((char *)mapped)[size - 1] = 'Z';
+  if (((char *)mapped)[size - 1] != 'Z') {
+    success = 0;
+  }
+  munmap(mapped, size);
+  close(fd);
+  unlink(filename);
+  return success;
+}
+
+int test_rapid_map_unmap() {
+  const char *filename = "test_rapid.txt";
+  if (create_test_file(filename, "Rapid", 4096) < 0)
+    return 0;
+
+  int fd = open(filename, O_RDONLY);
+  if (fd < 0) {
+    printf(2, "test_rapid_map_unmap: open failed\n");
+    unlink(filename);
+    return 0;
+  }
+
+  int success = 1;
+  for (int i = 0; i < 50; i++) {
+    void *mapped = mmap(0, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped == (void *)-1) {
+      printf(2, "test_rapid_map_unmap: mmap iteration %d failed\n", i);
+      success = 0;
+      break;
+    }
+
+    if (((char *)mapped)[0] != 'R') {
+      printf(2, "test_rapid_map_unmap: read iteration %d failed\n", i);
+      success = 0;
+      munmap(mapped, 4096);
+      break;
+    }
+    if (munmap(mapped, 4096) < 0) {
+      printf(2, "test_rapid_map_unmap: munmap iteration %d failed\n", i);
+      success = 0;
+      break;
+    }
+  }
+  close(fd);
+  unlink(filename);
+  return success;
+}
+
 int main(void){
   TEST(test_read_only_mapping);
   TEST(test_read_write_mapping);
@@ -481,7 +611,10 @@ int main(void){
   TEST(test_map_beyond_file);
   TEST(test_map_fixed_fails);
   TEST(test_partial_munmap);
+  TEST(test_many_mappings);
+  TEST(test_large_file_mapping);
+  TEST(test_rapid_map_unmap);
 
-  printf(1, "\n%d/15 test cases passed\n", passed_tests);
+  printf(1, "\n%d/18 test cases passed\n", passed_tests);
   exit();
 }
