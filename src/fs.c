@@ -179,6 +179,7 @@ iinit(int dev)
     initlock(&icache.inode[i].mappings.lock, "inodemappings");
     icache.inode[i].mappings.head = 0;
   }
+  islab_init();
 
   readsb(dev, &sb);
   cprintf("sb: size %d nblocks %d ninodes %d nlog %d logstart %d\
@@ -530,51 +531,24 @@ writei(struct inode *ip, char *src, uint off, uint n)
     }
 
     if(mn) {
-      // Page already in memory: copy into kernel page
       memmove((char*)mn->pa + in_page_off, src, m);
-      // Release mapping lock and then write-through to disk the affected blocks
       release(&ip->mappings.lock);
-
-      // Write through affected blocks so original behavior is preserved
-      // For each block overlapping [page_base + in_page_off, page_base + in_page_off + m)
-      uint write_start = page_base + in_page_off;
-      uint write_end = write_start + m; // exclusive
-      for(uint offb = write_start; offb < write_end; ){
-        uint bno = offb / BSIZE;
-        bp = bread(ip->dev, bmap(ip, bno));
-        uint boff = offb % BSIZE;
-        uint bytes = min(write_end - offb, BSIZE - boff);
-        // copy from page to block buffer
-        memmove(bp->data + boff, (char*)mn->pa + (offb - page_base), bytes);
-        log_write(bp);
-        brelse(bp);
-        offb += bytes;
-      }
-      continue;
     } else {
-      // No cached page: allocate one, populate from disk (for the page), add mapping,
-      // then copy our write into it and write-through to disk.
       release(&ip->mappings.lock);
 
       char *kpage = kalloc();
-      if(!kpage){
-        return -1;
-      }
+      if(!kpage) return -1;
 
-      // initialize kpage from disk: read page-sized data from file into kpage
-      // (partial pages must be read from disk; if page beyond file size, zero)
+      // Initialize kpage from disk
       for(uint offb = 0; offb < PGSIZE; offb += BSIZE){
         uint file_off = page_base + offb;
         if(file_off >= ip->size){
-          // beyond EOF: zero remainder
           memset(kpage + offb, 0, BSIZE);
-        }
-        else {
+        } else {
           uint bno = file_off / BSIZE;
           bp = bread(ip->dev, bmap(ip, bno));
           uint copy_start = file_off % BSIZE;
           uint bytes = min(BSIZE, ip->size - file_off);
-          // copy bytes starting at copy_start in block into our page at offb
           memmove(kpage + offb, bp->data + copy_start, bytes);
           if(bytes < BSIZE)
             memset(kpage + offb + bytes, 0, BSIZE - bytes);
@@ -583,54 +557,67 @@ writei(struct inode *ip, char *src, uint off, uint n)
       }
 
       acquire(&ip->mappings.lock);
-      // check if another process added the page while we were released
+      // Re-check race
       for(mn = ip->mappings.head; mn; mn = mn->next){
-        if(mn->offset == page_base)
-          break;
+        if(mn->offset == page_base) break;
       }
+
       if(mn){
-        kfree(kpage);
-        memmove((char*)mn->pa + in_page_off, src, m);
-        release(&ip->mappings.lock);
-        // Fall through to write blocks
+         kfree(kpage);
+         memmove((char*)mn->pa + in_page_off, src, m);
       } else {
-        // insert mapping node
-        // caller holds ip->mappings.lock now
-        if(add_mapping(ip, (uint)kpage, page_base) < 0) {
-          // failed to add mapping
-          kfree(kpage);
-          release(&ip->mappings.lock);
-          return -1;
-        }
-        // find the newly added node pointer again (cheap scan)
-        mn = ip->mappings.head;
-        while(mn && mn->offset != page_base) mn = mn->next;
-        // copy the desired bytes into the cached page
-        memmove(kpage + in_page_off, src, m);
-        release(&ip->mappings.lock);
+         if(add_mapping(ip, (uint)kpage, page_base) < 0){
+            kfree(kpage);
+            release(&ip->mappings.lock);
+            return -1;
+         }
+         // Use the newly allocated page address (kpage)
+         memmove(kpage + in_page_off, src, m);
       }
-      mn = ip->mappings.head;
-      while(mn && mn->offset != page_base) mn = mn->next;
-      // copy the desired bytes into the cached page
-      memmove(kpage + in_page_off, src, m);
       release(&ip->mappings.lock);
+    }
 
-      // write-through to disk the affected blocks overlapping our written range
-      uint write_start = page_base + in_page_off;
-      uint write_end = write_start + m; // exclusive
-      for(uint offb = write_start; offb < write_end; ){
-        uint bno = offb / BSIZE;
-        bp = bread(ip->dev, bmap(ip, bno));
-        uint boff = offb % BSIZE;
-        uint bytes = min(write_end - offb, BSIZE - boff);
-        // source in kpage: offset (offb - page_base)
-        memmove(bp->data + boff, kpage + (offb - page_base), bytes);
-        log_write(bp);
-        brelse(bp);
-        offb += bytes;
-      }
+    // Write through to disk the affected blocks
+    uint write_start = page_base + in_page_off;
+    uint write_end = write_start + m; // exclusive
+    for(uint offb = write_start; offb < write_end; ){
+      uint bno = offb / BSIZE;
+      bp = bread(ip->dev, bmap(ip, bno));
+      uint boff = offb % BSIZE;
+      uint bytes = min(write_end - offb, BSIZE - boff);
 
-      continue;
+      // Need to find the page address again if we don't have it handy?
+      // Actually we released the lock, so 'mn' pointer from inside if/else might be invalid if node freed?
+      // But we just added/found it. And we hold reference to inode.
+      // Nodes are not freed unless inode is destroyed or page reclamation (not implemented).
+      // However, safely, we should look up or remember address.
+      // But wait! If we didn't use `mn` in `else` block, how do we know the address?
+      // We know `kpage` if we allocated it. But if we raced and freed `kpage`, we need `mn->pa`.
+      // Let's just lookup the page again to be safe? Or use the address we wrote to.
+
+      // The original code used `memmove` from `kpage`.
+      // But if we raced, `kpage` was freed.
+      // So we need to look up the mapping again to get the physical address?
+      // Accessing `mn->pa` without lock is unsafe if `mn` can be freed.
+      // But here we are just reading from memory address.
+      // If the page is in the cache, it's pinned by `inode` existence?
+      // The `imap_node` is in the list.
+
+      // Let's assume for now we can't easily get the address without lock.
+      // BUT `bread` buffer `bp->data` is where we write TO.
+      // We copy FROM the page cache.
+      // So we need to read from the page cache.
+
+      // Simple solution:
+      // We already have `src`! We can copy from `src` to `bp->data` directly!
+      // We don't need to read from page cache. We are writing `src` to file.
+      // `memmove(bp->data + boff, src + (offb - write_start), bytes);`
+      // `src` is what we passed to `writei`.
+
+      memmove(bp->data + boff, src + (offb - write_start), bytes);
+      log_write(bp);
+      brelse(bp);
+      offb += bytes;
     }
   }
 
