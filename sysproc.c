@@ -108,7 +108,8 @@ create_mmap_node(int start, int end, int prot, int flags, int offset, struct fil
   node->offset = offset;
   node->f = f;
   node->next = next;
-  filedup(f);
+  if(f)
+    filedup(f);
   return node;
 }
 

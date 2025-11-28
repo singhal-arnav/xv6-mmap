@@ -411,18 +411,43 @@ page_fault_handler(struct proc *p, uint va)
     if(m->prot == PROT_NONE)
       return -1;
 
-    int page_index = (va - m->start) / PGSIZE;
-    int file_offset = m->offset + page_index * PGSIZE;
     char *mem = kalloc();
     if(!mem)
       return -1;
-
     memset(mem, 0, PGSIZE);
-    if(m->prot & PROT_READ){
+
+    if(!(m->flags & MAP_ANONYMOUS)) {
+      int page_index = (va - m->start) / PGSIZE;
+      int file_offset = m->offset + page_index * PGSIZE;
+      int private = (m->flags & MAP_PRIVATE) ? 1 : 0;
+      struct proc *proc_ref = private ? p : 0;
+      struct imap_node *mn = 0;
+
+      acquire(&m->f->ip->mappings.lock);
+      for(mn = m->f->ip->mappings.head; mn; mn = mn->next){
+        if(mn->offset == file_offset){
+          if(!private && !mn->private) {
+             kfree(mem);
+             mem = (char*)mn->pa;
+             mn->refs++;
+             release(&m->f->ip->mappings.lock);
+             goto map;
+          }
+        }
+      }
+
+      release(&m->f->ip->mappings.lock);
+
       ilock(m->f->ip);
       readi(m->f->ip, mem, file_offset, PGSIZE);
       iunlock(m->f->ip);
+
+      acquire(&m->f->ip->mappings.lock);
+      add_mapping(m->f->ip, (uint)mem, file_offset, private, proc_ref);
+      release(&m->f->ip->mappings.lock);
     }
+
+map:
 
     /* NOTE: PROT_EXEC deoesn't need special handling, since it can't be enforced */
     int flags = PTE_U;
