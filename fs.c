@@ -176,6 +176,8 @@ iinit(int dev)
   initlock(&icache.lock, "icache");
   for(i = 0; i < NINODE; i++) {
     initsleeplock(&icache.inode[i].lock, "inode");
+    initlock(&icache.inode[i].mappings.lock, "inodemappings");
+    icache.inode[i].mappings.head = 0;
   }
 
   readsb(dev, &sb);
@@ -266,6 +268,7 @@ iget(uint dev, uint inum)
   ip->inum = inum;
   ip->ref = 1;
   ip->valid = 0;
+  (ip->mappings).head = 0;
   release(&icache.lock);
 
   return ip;
@@ -667,4 +670,82 @@ struct inode*
 nameiparent(char *path, char *name)
 {
   return namex(path, 1, name);
+}
+
+int
+add_mapping(struct inode *ip, uint addr, uint offset) {
+  struct imap_node *p = (ip->mappings).head, *prev = 0;
+  while(p) {
+    prev = p;
+    if(p->pa == addr)
+      return 0;
+    p = p->next;
+  }
+  struct imap_node *n = islab_alloc_node();
+  if(n == 0)
+    return -1;
+  n->pa = addr;
+  n->offset = offset;
+  n->next = 0;
+  if(!(ip->mappings).head)
+    (ip->mappings).head = n;
+  else
+    prev->next = n;
+  return 0;
+}
+
+static struct {
+  struct spinlock lock;
+  void *freelist;
+} imap_node_cache;
+
+void
+islab_init(void)
+{
+  initlock(&imap_node_cache.lock, "imapcache");
+  imap_node_cache.freelist = 0;
+  islab_add_page();
+}
+
+struct imap_node*
+islab_alloc_node(void)
+{
+  struct imap_node *n;
+
+  acquire(&imap_node_cache.lock);
+  if(!imap_node_cache.freelist)
+    islab_add_page();
+  n = imap_node_cache.freelist;
+  if(n) {
+    imap_node_cache.freelist = n->next;
+    n->next = 0;
+    release(&imap_node_cache.lock);
+    return n;
+  }
+  release(&imap_node_cache.lock);
+
+  return 0;
+}
+
+void
+islab_free_node(struct imap_node *n)
+{
+  acquire(&imap_node_cache.lock);
+  n->next = imap_node_cache.freelist;
+  imap_node_cache.freelist = n;
+  release(&imap_node_cache.lock);
+}
+
+void
+islab_add_page(void)
+{
+  char *page = kalloc();
+  if(!page)
+    return;
+  int n = PGSIZE / sizeof(struct imap_node);
+  for(int i = 0; i < n; i++) {
+    struct imap_node *n = (struct imap_node*)page + i;
+    n->next = imap_node_cache.freelist;
+    imap_node_cache.freelist = n;
+  }
 }

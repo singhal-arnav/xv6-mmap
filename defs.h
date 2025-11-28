@@ -53,6 +53,11 @@ struct inode*   nameiparent(char*, char*);
 int             readi(struct inode*, char*, uint, uint);
 void            stati(struct inode*, struct stat*);
 int             writei(struct inode*, char*, uint, uint);
+int             add_mapping(struct inode*, uint, uint);
+void            islab_init(void);
+struct imap_node*  islab_alloc_node(void);
+void            islab_free_node(struct imap_node*);
+void            islab_add_page(void);
 
 // ide.c
 void            ideinit(void);
